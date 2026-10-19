@@ -1,3 +1,5 @@
+name: aion
+
 services:
   aion:
     build: .
