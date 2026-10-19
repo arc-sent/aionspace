@@ -1,0 +1,11 @@
+# Серверная настройка: подключить aion к сети Caddy (проект ~/csd), чтобы Caddy видел aion:8788.
+# Так же сделано у mother.
+services:
+  aion:
+    networks:
+      - default
+      - web
+networks:
+  web:
+    name: csd_default
+    external: true

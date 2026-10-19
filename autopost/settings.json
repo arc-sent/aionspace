@@ -1,0 +1,23 @@
+{
+  "run_time": "08:00",
+  "fallback_after_minutes": 15,
+  "posts_per_day": 4,
+  "min_posts": 3,
+  "claude_model": "claude-sonnet-5-5",
+  "claude_timeout_minutes": 30,
+  "claude_attempts": 2,
+  "history_days": 30,
+  "send_digest": true,
+  "vpn": {
+    "mode": "own",
+    "dir": "C:\\Users\\androed\\Desktop\\Marionette\\marionette\\autostart\\vpn",
+    "check_url": "https://api.anthropic.com/v1/models",
+    "prefer": ["Герман", "Germany", "German", "🇩🇪", "Frankfurt", "Франкфурт", "Berlin", "Берлин"],
+    "max_probe": 8
+  },
+  "wake_pc": true,
+  "task_hours": 2,
+  "sleep_after": true,
+  "sleep_only_if_idle_minutes": 10,
+  "python": ""
+}

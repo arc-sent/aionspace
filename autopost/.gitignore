@@ -1,0 +1,8 @@
+.env
+logs/
+state/
+out/
+history.json
+.running
+__pycache__/
+last_output.txt

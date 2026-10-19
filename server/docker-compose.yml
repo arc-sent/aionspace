@@ -1,0 +1,13 @@
+services:
+  aion:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # в контейнере API слушает все интерфейсы; наружу порт открыт только на localhost сервера,
+      # а в интернет его выставляет общий Caddy (~/csd/Caddyfile) по HTTPS
+      AION_API_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8788:8788"
+    volumes:
+      - ./data:/app/data

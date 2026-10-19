@@ -1,0 +1,19 @@
+# секреты: токены бота и API
+.env
+.env.*
+!.env.example
+
+# служебное Python
+__pycache__/
+.pytest_cache/
+
+# рабочие файлы ноутбука: журналы, ответы Claude, отметки, история тем
+autopost/logs/
+autopost/out/
+autopost/state/
+autopost/history.json
+autopost/last_output.txt
+autopost/.running
+
+# база и картинки сервера
+server/data/
