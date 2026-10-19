@@ -52,7 +52,10 @@ CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 # Колонки, добавленные позже: в уже работающей базе создаются при старте.
 #   vk_status: NULL — ВК не трогали (или выключен), published, failed, unknown (ответ wall.post потерян:
 #   запись могла выйти, поэтому сами не повторяем — только по кнопке)
-MIGRATIONS = [("vk_status", "TEXT"), ("vk_post_id", "INTEGER"), ("vk_error", "TEXT")]
+#   target: main — основной канал (+ ВК), dzen — статья в канал для Дзена
+#   image_src: адрес картинки (для статьи Дзена она показывается превью ссылки над текстом)
+MIGRATIONS = [("vk_status", "TEXT"), ("vk_post_id", "INTEGER"), ("vk_error", "TEXT"),
+              ("target", "TEXT NOT NULL DEFAULT 'main'"), ("image_src", "TEXT")]
 
 
 class DB:
@@ -86,8 +89,10 @@ class DB:
             ids = []
             for n, p in enumerate(posts, 1):
                 cur = c.execute(
-                    "INSERT INTO posts(batch_id, n, data, source_url, title, created_at) VALUES (?,?,?,?,?,?)",
-                    (bid, n, json.dumps(p, ensure_ascii=False), p["source_url"], p["title"], received_at))
+                    "INSERT INTO posts(batch_id, n, data, source_url, title, created_at, target) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (bid, n, json.dumps(p, ensure_ascii=False), p["source_url"], p["title"], received_at,
+                     "dzen" if p.get("kind") == "dzen" else "main"))
                 ids.append(cur.lastrowid)
             return bid, ids
 
@@ -134,10 +139,10 @@ class DB:
             return c.execute("UPDATE posts SET vk_status='posting' WHERE id=? AND vk_status IN ('failed','unknown')",
                              (pid,)).rowcount == 1
 
-    def taken_slots(self) -> set[str]:
+    def taken_slots(self, target: str = "main") -> set[str]:
         with self.conn() as c:
             rows = c.execute("SELECT slot_at FROM posts WHERE status IN ('approved','publishing','published') "
-                             "AND slot_at IS NOT NULL").fetchall()
+                             "AND slot_at IS NOT NULL AND target=?", (target,)).fetchall()
         return {r["slot_at"] for r in rows}
 
     def due(self, now_iso: str) -> list[sqlite3.Row]:
@@ -145,18 +150,19 @@ class DB:
             return c.execute("SELECT * FROM posts WHERE status='approved' AND slot_at<=? ORDER BY slot_at, id",
                              (now_iso,)).fetchall()
 
-    def known_sources(self) -> set[str]:
-        """Источники, которые уже были (кроме отклонённых и снятых: их тему можно предложить снова)."""
+    def known_sources(self, target: str = "main") -> set[str]:
+        """Источники, которые уже были на этой площадке (кроме отклонённых и снятых: их тему можно предложить снова)."""
         with self.conn() as c:
-            rows = c.execute("SELECT source_url FROM posts WHERE status NOT IN ('rejected','expired')").fetchall()
+            rows = c.execute("SELECT source_url FROM posts WHERE status NOT IN ('rejected','expired') AND target=?",
+                             (target,)).fetchall()
         return {r["source_url"] for r in rows}
 
     def history(self, since_iso: str) -> list[dict]:
         with self.conn() as c:
-            rows = c.execute("SELECT created_at, title, source_url, status FROM posts WHERE created_at>=? "
+            rows = c.execute("SELECT created_at, title, source_url, status, target FROM posts WHERE created_at>=? "
                              "ORDER BY id", (since_iso,)).fetchall()
         return [{"date": r["created_at"][:10], "title": r["title"], "source_url": r["source_url"],
-                 "status": r["status"]} for r in rows]
+                 "status": r["status"], "target": r["target"]} for r in rows]
 
     def counts(self) -> dict[str, int]:
         with self.conn() as c:

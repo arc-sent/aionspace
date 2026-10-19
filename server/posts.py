@@ -80,6 +80,104 @@ def validate(data: object, seen_sources: set[str]) -> tuple[list[dict], list[str
     return out, problems
 
 
+TEXT_LIMIT = 4096
+
+
+def validate_articles(data: object, seen_sources: set[str]) -> tuple[list[dict], list[str]]:
+    """Статьи для Дзена: {"articles": [{title, lead, sections: [{heading, paragraphs}], outro, cta, ...}]}."""
+    problems: list[str] = []
+    items = data.get("articles") if isinstance(data, dict) else data
+    if not items:
+        return [], []
+    if not isinstance(items, list):
+        return [], ["Дзен: поле articles не список"]
+    seen = set(seen_sources)
+    out: list[dict] = []
+    for i, a in enumerate(items, 1):
+        if not isinstance(a, dict):
+            problems.append("Дзен, статья %d: неверный формат" % i)
+            continue
+        title = str(a.get("title", "")).strip()
+        src = str(a.get("source_url", "")).strip()
+        sections = []
+        for s in a.get("sections") or []:
+            if not isinstance(s, dict):
+                continue
+            paras = [str(x).strip() for x in (s.get("paragraphs") or []) if str(x).strip()]
+            if paras:
+                sections.append({"heading": str(s.get("heading", "")).strip(), "paragraphs": paras})
+        if not title or not sections:
+            problems.append("Дзен, статья %d: нет заголовка или разделов" % i)
+            continue
+        if not src.startswith("https://"):
+            problems.append("Дзен, статья %d («%s»): нет ссылки на первоисточник, пропущена" % (i, title[:40]))
+            continue
+        if src in seen:
+            problems.append("Дзен, статья %d («%s»): этот источник уже был, пропущена" % (i, title[:40]))
+            continue
+        tags = []
+        for t in (a.get("hashtags") or [])[:3]:
+            t = re.sub(r"\s+", "", str(t))
+            if t:
+                tags.append(t if t.startswith("#") else "#" + t)
+        out.append({
+            "kind": "dzen",
+            "rubric": str(a.get("rubric", "")).strip() or "Статья",
+            "title": title, "lead": str(a.get("lead", "")).strip(), "sections": sections,
+            "outro": str(a.get("outro", "")).strip(), "cta": str(a.get("cta", "")).strip(),
+            "hashtags": tags,
+            "image_url": str(a.get("image_url", "")).strip(),
+            "image_page_url": str(a.get("image_page_url", "")).strip(),
+            "credit": str(a.get("credit", "")).strip(),
+            "source_url": src,
+            "source_label": str(a.get("source_label", "")).strip() or (urlparse(src).hostname or "источник"),
+            "check": str(a.get("check", "")).strip(),
+            "interactive": str(a.get("interactive", "")).strip(),
+        })
+        seen.add(src)
+    return out, problems
+
+
+def build_article(a: dict, default_cta: str, cta_marker: str, with_credit: bool = True) -> tuple[str, list[str]]:
+    """Статья одним сообщением (до 4096 знаков): жирный заголовок, лид, разделы с жирными подзаголовками,
+    концовка, крючок на основной канал, фото/источник, хештеги. Если длиннее лимита — с конца убираются
+    разделы (минимум два остаются). Возвращает (HTML, предупреждения)."""
+    e = html.escape
+    warns: list[str] = []
+    cta = a.get("cta") or ""
+    if cta_marker and cta_marker.lower() not in cta.lower():
+        cta = (cta + "\n\n" + default_cta).strip() if cta else default_cta
+    sections = list(a["sections"])
+
+    def assemble(secs):
+        parts = ["<b>%s</b>" % e(a["title"])]
+        if a.get("lead"):
+            parts.append("<i>%s</i>" % e(a["lead"]))
+        for s in secs:
+            block = ("<b>%s</b>\n" % e(s["heading"]) if s.get("heading") else "") + "\n\n".join(e(p) for p in s["paragraphs"])
+            parts.append(block)
+        if a.get("outro"):
+            parts.append(e(a["outro"]))
+        if cta:
+            parts.append(e(cta))
+        tail = []
+        if with_credit and a.get("credit"):
+            tail.append("<i>Фото: %s</i>" % e(a["credit"]))
+        tail.append('<i>Источник: <a href="%s">%s</a></i>' % (e(a["source_url"], quote=True), e(a["source_label"])))
+        if a.get("hashtags"):
+            tail.append(e(" ".join(a["hashtags"])))
+        return "\n\n".join(parts) + "\n\n" + "\n".join(tail)
+
+    text = assemble(sections)
+    while utf16_len(plain(text)) > TEXT_LIMIT - 50 and len(sections) > 2:
+        dropped = sections.pop()
+        warns.append("«%s»: длиннее лимита Telegram, убран раздел «%s»" % (a["title"][:40], dropped.get("heading", "")[:40]))
+        text = assemble(sections)
+    if utf16_len(plain(text)) > TEXT_LIMIT:
+        raise ValueError("статья длиннее 4096 знаков даже после сокращения")
+    return text, warns
+
+
 # --------------------------------------------------------------------------- оформление
 def build_caption(p: dict, with_credit: bool = True) -> str:
     e = html.escape
@@ -123,10 +221,15 @@ def vk_text(p: dict, has_image: bool) -> str:
     return "\n\n".join(parts) + "\n\n" + "\n".join(tail)
 
 
-def build_digest(day: str, posts: list[dict], problems: list[str], slots: list[tuple[int, int]]) -> str:
+def build_digest(day: str, posts: list[dict], problems: list[str], slots: list[tuple[int, int]],
+                 articles: list[dict] | None = None, dzen_slots: list[tuple[int, int]] | None = None,
+                 dzen_channel: str = "") -> str:
     when = ", ".join("%d:%02d" % s for s in slots)
     lines = ["Aion Space, подборка за %s" % day, "Постов на утверждение: %d" % len(posts),
              "Утверждённые выходят в канал в %s, по одному." % when, ""]
+    if articles:
+        lines.insert(2, "Статей для Дзена: %d (%s, в %s)" % (
+            len(articles), dzen_channel, ", ".join("%d:%02d" % s for s in dzen_slots or [])))
     for i, p in enumerate(posts, 1):
         lines.append("%d. %s: %s" % (i, p["rubric"], p["title"]))
         if p.get("image_page_url"):
@@ -135,6 +238,13 @@ def build_digest(day: str, posts: list[dict], problems: list[str], slots: list[t
             lines.append("   Проверка: " + p["check"])
         if p.get("video_idea"):
             lines.append("   Видео: " + p["video_idea"])
+        lines.append("")
+    for i, a in enumerate(articles or [], 1):
+        lines.append("Дзен %d. %s: %s" % (i, a["rubric"], a["title"]))
+        if a.get("interactive"):
+            lines.append("   Интерактив: " + a["interactive"])
+        if a.get("check"):
+            lines.append("   Проверка: " + a["check"])
         lines.append("")
     if problems:
         lines.append("Предупреждения:")
@@ -210,10 +320,10 @@ def prepare_image(data: bytes) -> bytes:
     raise ValueError("не удалось сжать до 9,5 МБ")
 
 
-def fetch_image(p: dict, domains: list[str]) -> tuple[bytes | None, str]:
-    """(байты JPEG | None, пояснение, почему картинки нет)."""
+def fetch_image(p: dict, domains: list[str]) -> tuple[bytes | None, str, str]:
+    """(байты JPEG | None, пояснение, почему картинки нет, адрес картинки, с которого она скачана)."""
     if not p.get("credit"):
-        return None, "нет подписи автора фото, картинка не использована"
+        return None, "нет подписи автора фото, картинка не использована", ""
     candidates = [("image_url", p["image_url"])] if p.get("image_url") else []
     last = "нет ссылки на картинку"
     tried_og = False
@@ -233,7 +343,7 @@ def fetch_image(p: dict, domains: list[str]) -> tuple[bytes | None, str]:
             last = "домен картинки не из списка открытых источников: %s" % (urlparse(url).hostname or url)
             continue
         try:
-            return prepare_image(download(url)), ""
+            return prepare_image(download(url)), "", url
         except Exception as ex:
             last = "картинка не скачалась (%s): %s" % (kind, ex)
-    return None, last
+    return None, last, ""

@@ -35,12 +35,28 @@ class Service:
             raise ValueError("ожидается JSON-объект с полем posts")
         now = self.now()
         day = str(body.get("day") or now.date().isoformat())[:10]
-        accepted, problems = P.validate(body, self.db.known_sources())
-        problems = [str(x) for x in (body.get("problems") or []) if str(x).strip()] + problems
-        bid, ids = self.db.add_batch(day, now.isoformat(), accepted, problems)
-        log.info("подборка %s за %s: принято %d, проблем %d", bid, day, len(ids), len(problems))
-        return {"ok": True, "batch": bid, "accepted": len(ids), "problems": problems,
-                "sources": [p["source_url"] for p in accepted]}
+        accepted, problems = P.validate(body, self.db.known_sources("main")) if body.get("posts") else ([], [])
+        articles, a_problems = P.validate_articles(body, self.db.known_sources("dzen"))
+        if articles and not self.cfg.dzen_channel_id:
+            a_problems.append("Дзен: пришло статей %d, но DZEN_CHANNEL_ID не задан — статьи не приняты" % len(articles))
+            articles = []
+        problems = [str(x) for x in (body.get("problems") or []) if str(x).strip()] + problems + a_problems
+        bid, ids = self.db.add_batch(day, now.isoformat(), accepted + articles, problems)
+        log.info("подборка %s за %s: постов %d, статей %d, проблем %d", bid, day, len(accepted), len(articles),
+                 len(problems))
+        return {"ok": True, "batch": bid, "accepted": len(accepted), "articles": len(articles), "problems": problems,
+                "sources": [p["source_url"] for p in accepted],
+                "article_sources": [a["source_url"] for a in articles]}
+
+    # ------------------------------------------------------------------ площадки
+    def _is_dzen(self, r) -> bool:
+        return r["target"] == "dzen"
+
+    def _channel(self, r):
+        return self.cfg.dzen_channel_id if self._is_dzen(r) else self.cfg.channel_id
+
+    def _slots(self, r):
+        return self.cfg.dzen_slots if self._is_dzen(r) else self.cfg.slots
 
     def history(self, days: int) -> list[dict]:
         since = (self.now() - dt.timedelta(days=days)).isoformat()
@@ -59,7 +75,10 @@ class Service:
             rows = self.db.batch_posts(b["id"])
             problems = json.loads(b["problems"])
             if rows:
-                text = P.build_digest(b["day"], [json.loads(r["data"]) for r in rows], problems, self.cfg.slots)
+                main = [json.loads(r["data"]) for r in rows if not self._is_dzen(r)]
+                dzen = [json.loads(r["data"]) for r in rows if self._is_dzen(r)]
+                text = P.build_digest(b["day"], main, problems, self.cfg.slots, dzen, self.cfg.dzen_slots,
+                                      self.cfg.dzen_channel_id)
                 if self.vk:
                     text = text.replace(" по одному.", " по одному, и в канал, и в ВК.", 1)
             else:
@@ -79,13 +98,14 @@ class Service:
             return
         data = json.loads(r["data"])
         try:
-            img, why = self.fetch_image(data, self.cfg.image_domains)
+            res = self.fetch_image(data, self.cfg.image_domains)
+            img, why, src = res[0], res[1], (res[2] if len(res) > 2 else "")
         except Exception as ex:
-            img, why = None, "картинка не скачалась: %s" % ex
+            img, why, src = None, "картинка не скачалась: %s" % ex, ""
         if img:
             path = self.images / ("%d.jpg" % r["id"])
             path.write_bytes(img)
-            self.db.update(r["id"], image_path=str(path))
+            self.db.update(r["id"], image_path=str(path), image_src=src or None)
         else:
             self.db.update(r["id"], image_note=why or "картинки нет")
 
@@ -103,6 +123,12 @@ class Service:
     def _send_parts(self, chat, r) -> tuple[int, str | None]:
         """Отправить пост как он выглядит в канале. (id первого сообщения, file_id фото)."""
         data = json.loads(r["data"])
+        if self._is_dzen(r):
+            # статья — одно сообщение до 4096 знаков; фото — крупное превью ссылки на картинку над текстом
+            text, _ = P.build_article(data, self.cfg.dzen_cta, self.cfg.dzen_cta_marker,
+                                      with_credit=bool(r["image_src"]))
+            res = self.tg.send_text(chat, text, preview_url=r["image_src"] or "")
+            return res["message_id"], None
         photo = self._image_ref(r)
         first, file_id = None, r["image_file_id"]
         for kind, text in P.render(data, photo is not None):
@@ -141,7 +167,7 @@ class Service:
         err = None
         if not r["channel_msg"]:
             try:
-                msg_id, file_id = self._send_parts(self.cfg.channel_id, r)
+                msg_id, file_id = self._send_parts(self._channel(r), r)
                 self.db.update(pid, channel_msg=msg_id, image_file_id=file_id or r["image_file_id"])
                 log.info("пост %s опубликован в канал, сообщение %s", pid, msg_id)
             except Exception as ex:
@@ -162,6 +188,8 @@ class Service:
         if not self.vk:
             return
         r = self.db.get(pid)
+        if self._is_dzen(r):            # статьи Дзена в ВК не дублируем
+            return
         if r["vk_status"] == "published" or (r["vk_status"] == "unknown" and not force):
             return
         image = None
@@ -182,8 +210,8 @@ class Service:
         log.info("пост %s опубликован в ВК, запись %s", pid, post_id)
 
     # ------------------------------------------------------------------ карточка управления
-    def channel_link(self, msg_id: int | None) -> str:
-        ch = str(self.cfg.channel_id)
+    def channel_link(self, msg_id: int | None, channel=None) -> str:
+        ch = str(channel or self.cfg.channel_id)
         if not msg_id:
             return ""
         if ch.startswith("@"):
@@ -193,7 +221,7 @@ class Service:
         return ""
 
     def _vk_line(self, r) -> str:
-        if not self.vk or r["status"] not in ("published", "failed"):
+        if not self.vk or self._is_dzen(r) or r["status"] not in ("published", "failed"):
             return ""
         st = r["vk_status"]
         if st == "published":
@@ -209,12 +237,17 @@ class Service:
 
     def _control_body(self, r) -> str:
         data = json.loads(r["data"])
-        total = len(self.db.batch_posts(r["batch_id"]))
-        head = "Пост %d из %d · %s\n«%s»" % (r["n"], total, data.get("rubric", ""), r["title"])
+        same = [x for x in self.db.batch_posts(r["batch_id"]) if x["target"] == r["target"]]
+        n = next((k for k, x in enumerate(same, 1) if x["id"] == r["id"]), r["n"])
+        kind = "Статья для Дзена" if self._is_dzen(r) else "Пост"
+        head = "%s %d из %d · %s\n«%s»" % (kind, n, len(same), data.get("rubric", ""), r["title"])
         st = r["status"]
         if st in ("new", "review"):
             note = "\n⚠️ Без фото: %s" % r["image_note"] if r["image_note"] and not r["image_path"] else ""
-            where = "в канале и в ВК" if self.vk else "в канале"
+            if self._is_dzen(r):
+                where = "в %s (оттуда — в Дзен)" % self.cfg.dzen_channel_id
+            else:
+                where = "в канале и в ВК" if self.vk else "в канале"
             return "%s%s\n\nОпубликовать %s?" % (head, note, where)
         if st == "approved":
             return "%s\n\n✅ Утверждён, выйдет %s" % (head, P.human_time(r["slot_at"], self.now()))
@@ -222,7 +255,7 @@ class Service:
             return "%s\n\n⏳ Публикуется…" % head
         if st == "published":
             when = P.human_time(r["published_at"], self.now())
-            return "%s\n\n📢 Опубликован %s\n%s" % (head, when, self.channel_link(r["channel_msg"]))
+            return "%s\n\n📢 Опубликован %s\n%s" % (head, when, self.channel_link(r["channel_msg"], self._channel(r)))
         if st == "rejected":
             return "%s\n\n❌ Отклонён" % head
         if st == "expired":
@@ -282,7 +315,8 @@ class Service:
         """Действие кнопки. Возвращает короткий ответ для всплывашки."""
         now = self.now()
         if action == "ap":
-            slot = P.next_slot(now, self.cfg.slots, self.db.taken_slots()).isoformat()
+            r = self.db.get(pid)
+            slot = P.next_slot(now, self._slots(r), self.db.taken_slots(r["target"])).isoformat()
             if self.db.transition(pid, ("review", "new"), "approved", slot_at=slot):
                 return "Выйдет %s" % P.human_time(slot, now)
             return "Уже обработан"
@@ -317,7 +351,11 @@ class Service:
         if queue:
             lines.append("")
             for r in sorted(queue, key=lambda r: r["slot_at"]):
-                lines.append("• %s — «%s»" % (P.human_time(r["slot_at"], self.now()), r["title"][:60]))
+                tag = "Дзен · " if self._is_dzen(r) else ""
+                lines.append("• %s — %s«%s»" % (P.human_time(r["slot_at"], self.now()), tag, r["title"][:60]))
         lines.append("")
         lines.append("Слоты: " + ", ".join("%d:%02d" % s for s in self.cfg.slots))
+        if self.cfg.dzen_channel_id:
+            lines.append("Дзен (%s): %s" % (self.cfg.dzen_channel_id,
+                                            ", ".join("%d:%02d" % s for s in self.cfg.dzen_slots)))
         return "\n".join(lines)

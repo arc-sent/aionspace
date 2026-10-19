@@ -22,7 +22,7 @@ ADMIN, CHANNEL = 111, "@aion_test"
 
 class FakeTG:
     def __init__(self):
-        self.sent, self.edits, self.answers = [], [], []
+        self.sent, self.edits, self.answers, self.previews = [], [], [], []
         self.fail_channel = 0
         self._id = 100
 
@@ -37,7 +37,8 @@ class FakeTG:
             res["photo"] = [{"file_id": "small"}, {"file_id": "FILE%d" % self._id}]
         return res
 
-    def send_text(self, chat, text, markup=None, html_mode=True):
+    def send_text(self, chat, text, markup=None, html_mode=True, preview_url=""):
+        self.previews.append(preview_url)
         return self._msg(chat, "text", text, markup)
 
     def send_photo(self, chat, photo, caption, markup=None):

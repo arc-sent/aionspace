@@ -56,6 +56,9 @@ DEFAULTS = {
     # "server": подборка уходит на сервер Aion (утверждение кнопками и публикация в канал по слотам);
     # "telegram": как раньше, посты сразу приходят в бота
     "delivery": "telegram",
+    # статьи для Дзена (канал t.me/interesOKosmose -> @zen_sync_bot -> Дзен); только при delivery = server
+    "dzen_articles_per_day": 1,
+    "dzen_prompt": "dzen_prompt.txt",
     "pause_between_messages_sec": 1.5,
     "telegram_api": "https://api.telegram.org",
     "image_domains": ["nasa.gov", "esawebb.org", "esahubble.org", "eso.org", "esa.int",
@@ -178,11 +181,13 @@ def server_history(cfg: dict, env: dict) -> list[dict]:
         return []
 
 
-def recent_topics(cfg: dict, today: dt.date) -> str:
+def recent_topics(cfg: dict, today: dt.date, target: str = "main") -> str:
     since = today - dt.timedelta(days=int(cfg["history_days"]))
     lines = []
     items, seen = [], set()
-    for h in load_history() + server_history(cfg, load_env()):
+    local = load_history() if target == "main" else []
+    remote = [h for h in server_history(cfg, load_env()) if (h.get("target") or "main") == target]
+    for h in local + remote:
         if h.get("source_url") in seen:
             continue
         seen.add(h.get("source_url"))
@@ -198,13 +203,14 @@ def recent_topics(cfg: dict, today: dt.date) -> str:
 
 
 # --------------------------------------------------------------------------- Claude
-def build_prompt(cfg: dict, today: dt.date) -> str:
-    text = (HERE / "prompt.txt").read_text(encoding="utf-8-sig")
+def build_prompt(cfg: dict, today: dt.date, dzen: bool = False) -> str:
+    text = (HERE / (cfg["dzen_prompt"] if dzen else "prompt.txt")).read_text(encoding="utf-8-sig")
     repl = {
         "{TODAY}": "%d %s %d" % (today.day, MONTHS[today.month - 1], today.year),
         "{TODAY_ISO}": today.isoformat(),
         "{N_POSTS}": str(cfg["posts_per_day"]),
-        "{RECENT_TOPICS}": recent_topics(cfg, today),
+        "{N_ARTICLES}": str(cfg["dzen_articles_per_day"]),
+        "{RECENT_TOPICS}": recent_topics(cfg, today, "dzen" if dzen else "main"),
     }
     for k, v in repl.items():
         text = text.replace(k, v)
@@ -281,11 +287,11 @@ def parse_json(text: str) -> dict:
     return json.loads(t[a:b + 1])
 
 
-def generate(cfg: dict, today: dt.date) -> dict:
+def generate(cfg: dict, today: dt.date, dzen: bool = False) -> dict:
     claude = find_claude(cfg)
     if not claude:
         raise RuntimeError("консольный claude не найден в PATH (npm i -g @anthropic-ai/claude-code, затем claude -> /login)")
-    prompt = build_prompt(cfg, today)
+    prompt = build_prompt(cfg, today, dzen)
     check = cfg["vpn"]["check_url"]
     proxy = ""
     env = os.environ.copy()
@@ -307,7 +313,7 @@ def generate(cfg: dict, today: dt.date) -> dict:
         for attempt in range(1, int(cfg["claude_attempts"]) + 1):
             cmd = [claude, "-p", "--model", cfg["claude_model"], "--no-session-persistence",
                    "--allowedTools", "WebSearch", "WebFetch"]
-            log("запуск claude (%s), попытка %d" % (cfg["claude_model"], attempt))
+            log("запуск claude (%s%s), попытка %d" % (cfg["claude_model"], ", статьи для Дзена" if dzen else "", attempt))
             try:
                 p = subprocess.run(cmd, input=prompt.encode("utf-8"), capture_output=True, env=env,
                                    timeout=int(cfg["claude_timeout_minutes"]) * 60)
@@ -317,7 +323,7 @@ def generate(cfg: dict, today: dt.date) -> dict:
                 continue
             out = p.stdout.decode("utf-8", "replace")
             OUT.mkdir(exist_ok=True)
-            (OUT / ("claude_%s.txt" % today.isoformat())).write_text(out, encoding="utf-8")
+            (OUT / ("claude_%s%s.txt" % ("dzen_" if dzen else "", today.isoformat()))).write_text(out, encoding="utf-8")
             if p.returncode != 0:
                 last_err = "claude завершился с кодом %s: %s" % (p.returncode, p.stderr.decode("utf-8", "replace")[-300:])
                 log(last_err)
@@ -614,14 +620,36 @@ def connect_tg(tg: Telegram, cfg: dict) -> bool:
     return False
 
 
-def push_batch(env: dict, today: dt.date, posts: list[dict], problems: list[str]) -> dict:
+def get_articles(args, cfg: dict, data: dict, today: dt.date, problems: list[str]) -> list[dict]:
+    """Статьи для Дзена: вторым запуском Claude по dzen_prompt.txt (или из --from-json). Сбой не мешает постам."""
+    if cfg.get("delivery") != "server" or int(cfg.get("dzen_articles_per_day") or 0) <= 0:
+        return []
+    if args.from_json:
+        items = data.get("articles") if isinstance(data, dict) else None
+    else:
+        try:
+            items = generate(cfg, today, dzen=True).get("articles")
+        except Exception as ex:
+            problems.append("Дзен: статьи не получились: %s" % scrub(str(ex))[:300])
+            log(problems[-1])
+            return []
+    items = [a for a in (items or []) if isinstance(a, dict)][: int(cfg["dzen_articles_per_day"])]
+    OUT.mkdir(exist_ok=True)
+    (OUT / ("articles_%s.json" % today.isoformat())).write_text(
+        json.dumps({"articles": items}, ensure_ascii=False, indent=1), encoding="utf-8")
+    log("статей для Дзена: %d" % len(items))
+    return items
+
+
+def push_batch(env: dict, today: dt.date, posts: list[dict], problems: list[str],
+               articles: list[dict] | None = None) -> dict:
     """Отправить проверенную подборку на сервер Aion. Сервер сам пришлёт карточки на утверждение.
     Повторная отправка той же подборки безопасна: сервер пропускает источники, которые у него уже есть."""
     url, token = env.get("AION_SERVER_URL", "").rstrip("/"), env.get("AION_SERVER_TOKEN", "")
     if not url or not token:
         raise RuntimeError("в .env не заданы AION_SERVER_URL и AION_SERVER_TOKEN")
     _SECRETS.append(token)
-    body = {"day": today.isoformat(), "posts": posts, "problems": problems}
+    body = {"day": today.isoformat(), "posts": posts, "problems": problems, "articles": articles or []}
     last = "?"
     for attempt in range(1, 4):
         try:
@@ -678,15 +706,23 @@ def cmd_run(args, cfg: dict, env: dict) -> int:
         for pr in problems:
             log("проблема: " + pr)
         posts = posts[: int(cfg["posts_per_day"]) + 1]
+        articles = get_articles(args, cfg, data, today, problems)
         if args.dry_run:
             for i, p in enumerate(posts, 1):
                 log("--- пост %d (%s) ---\n%s" % (i, p["rubric"], plain(build_caption(p))))
                 log("картинка: %s | подпись: %s" % (p["image_url"] or p["image_page_url"] or "нет", p["credit"] or "нет"))
+            for i, a in enumerate(articles, 1):
+                body = [a.get("title", ""), a.get("lead", "")]
+                for sec in a.get("sections") or []:
+                    body += [sec.get("heading", "")] + list(sec.get("paragraphs") or [])
+                body += [a.get("outro", ""), a.get("cta", ""), "Источник: %s" % a.get("source_url", "")]
+                text = "\n\n".join(x for x in body if x)
+                log("--- статья для Дзена %d (%s, %d знаков) ---\n%s" % (i, a.get("rubric", ""), len(text), text))
             log("dry-run: в Telegram ничего не отправлено")
             return 0
         if cfg.get("delivery") == "server":
             try:
-                res = push_batch(env, today, posts, problems)
+                res = push_batch(env, today, posts, problems, articles)
             except Exception as ex:
                 log("сервер Aion не принял подборку: %s" % ex)
                 tg_vpn = connect_tg(tg, cfg)
@@ -708,7 +744,8 @@ def cmd_run(args, cfg: dict, env: dict) -> int:
             if n >= int(cfg["min_posts"]):
                 STATE.mkdir(exist_ok=True)
                 done.write_text(now_msk().isoformat(), encoding="utf-8")
-                log("готово: сервер принял %d постов (подборка %s), они придут вам на утверждение" % (n, res.get("batch")))
+                log("готово: сервер принял %d постов и %d статей для Дзена (подборка %s), они придут вам на утверждение"
+                    % (n, int(res.get("articles") or 0), res.get("batch")))
                 return 0
             log("сервер принял только %d из %s, день не помечен выполненным" % (n, cfg["min_posts"]))
             return 1

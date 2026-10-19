@@ -58,6 +58,11 @@ class Config:
     vk_token: str = ""
     vk_group: str = ""          # ссылка на группу, короткое имя или число; пусто — ВК выключен
     vk_proxy: str = ""
+    # Дзен: статьи выходят в отдельный Telegram-канал, который @zen_sync_bot переносит в Дзен
+    dzen_channel_id: str = ""
+    dzen_slots: list[tuple[int, int]] = field(default_factory=lambda: [(12, 0)])
+    dzen_cta: str = "Каждый день новости космоса простыми словами — в Telegram-канале Aion Space: t.me/aion_space"
+    dzen_cta_marker: str = "aion_space"   # если крючка на основной канал в тексте нет, программа добавит dzen_cta
 
     @property
     def vk_enabled(self) -> bool:
@@ -83,7 +88,11 @@ class Config:
             vk_token=e("VK_TOKEN", ""),
             vk_group=e("VK_GROUP", ""),
             vk_proxy=e("VK_PROXY", ""),
+            dzen_channel_id=e("DZEN_CHANNEL_ID", ""),
+            dzen_slots=parse_slots(e("DZEN_SLOTS") or "12"),
         )
+        if e("DZEN_CTA"):
+            cfg.dzen_cta = e("DZEN_CTA")
         if e("IMAGE_DOMAINS"):
             cfg.image_domains = [d.strip().lower() for d in e("IMAGE_DOMAINS").split(",") if d.strip()]
         return cfg

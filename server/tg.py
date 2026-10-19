@@ -47,8 +47,15 @@ class Telegram:
         raise TelegramError(last)
 
     # ---- отправка с запасным вариантом «без разметки», если Telegram не принял HTML
-    def send_text(self, chat, text: str, markup: dict | None = None, html_mode: bool = True) -> dict:
-        data = {"chat_id": chat, "text": text, "disable_web_page_preview": "true", "reply_markup": markup}
+    def send_text(self, chat, text: str, markup: dict | None = None, html_mode: bool = True,
+                  preview_url: str = "") -> dict:
+        """preview_url — картинка крупным превью над текстом (так у длинной статьи есть фото, а подпись
+        не ограничена 1024 знаками). Без него превью ссылок выключено."""
+        data = {"chat_id": chat, "text": text, "reply_markup": markup}
+        if preview_url:
+            data["link_preview_options"] = {"url": preview_url, "prefer_large_media": True, "show_above_text": True}
+        else:
+            data["link_preview_options"] = {"is_disabled": True}
         if html_mode:
             data["parse_mode"] = "HTML"
         try:

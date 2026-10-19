@@ -29,5 +29,7 @@
   "sleep_after": true,
   "sleep_only_if_idle_minutes": 10,
   "python": "",
-  "delivery": "server"
+  "delivery": "server",
+  "dzen_articles_per_day": 1,
+  "dzen_prompt": "dzen_prompt.txt"
 }
