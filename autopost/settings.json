@@ -30,6 +30,6 @@
   "sleep_only_if_idle_minutes": 10,
   "python": "",
   "delivery": "server",
-  "dzen_articles_per_day": 1,
+  "dzen_articles_per_day": 2,
   "dzen_prompt": "dzen_prompt.txt"
 }
