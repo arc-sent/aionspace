@@ -49,6 +49,11 @@ CREATE INDEX IF NOT EXISTS posts_status ON posts(status);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 """
 
+# Колонки, добавленные позже: в уже работающей базе создаются при старте.
+#   vk_status: NULL — ВК не трогали (или выключен), published, failed, unknown (ответ wall.post потерян:
+#   запись могла выйти, поэтому сами не повторяем — только по кнопке)
+MIGRATIONS = [("vk_status", "TEXT"), ("vk_post_id", "INTEGER"), ("vk_error", "TEXT")]
+
 
 class DB:
     def __init__(self, path: Path):
@@ -56,6 +61,10 @@ class DB:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.conn() as c:
             c.executescript(SCHEMA)
+            have = {r["name"] for r in c.execute("PRAGMA table_info(posts)")}
+            for col, typ in MIGRATIONS:
+                if col not in have:
+                    c.execute("ALTER TABLE posts ADD COLUMN %s %s" % (col, typ))
 
     @contextmanager
     def conn(self):
@@ -118,6 +127,12 @@ class DB:
         q = "UPDATE posts SET %s WHERE id=? AND status IN (%s)" % (sets, ",".join("?" * len(old)))
         with self.conn() as c:
             return c.execute(q, (new, *fields.values(), pid, *old)).rowcount == 1
+
+    def vk_claim(self, pid: int) -> bool:
+        """Повтор ВК по кнопке: захватить пост (failed/unknown -> posting), чтобы двойное нажатие не дало дубль."""
+        with self.conn() as c:
+            return c.execute("UPDATE posts SET vk_status='posting' WHERE id=? AND vk_status IN ('failed','unknown')",
+                             (pid,)).rowcount == 1
 
     def taken_slots(self) -> set[str]:
         with self.conn() as c:

@@ -108,6 +108,21 @@ def render(p: dict, has_image: bool) -> list[tuple[str, str]]:
     return [("photo", caption)]
 
 
+def vk_text(p: dict, has_image: bool) -> str:
+    """Тот же пост для стены ВК: разметки там нет, поэтому простой текст, заголовок первой строкой,
+    ссылка на источник адресом (ВК сам делает её кликабельной)."""
+    parts = [p["title"]] + list(p["paragraphs"])
+    if p.get("outro"):
+        parts.append(p["outro"])
+    tail = []
+    if has_image and p.get("credit"):
+        tail.append("Фото: %s" % p["credit"])
+    tail.append("Источник: %s" % p["source_url"])
+    if p.get("hashtags"):
+        tail.append(" ".join(p["hashtags"]))
+    return "\n\n".join(parts) + "\n\n" + "\n".join(tail)
+
+
 def build_digest(day: str, posts: list[dict], problems: list[str], slots: list[tuple[int, int]]) -> str:
     when = ", ".join("%d:%02d" % s for s in slots)
     lines = ["Aion Space, подборка за %s" % day, "Постов на утверждение: %d" % len(posts),

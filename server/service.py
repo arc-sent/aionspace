@@ -13,6 +13,7 @@ import posts as P
 from config import Config
 from db import DB
 from tg import Telegram, TelegramError, kb, scrub
+from vk import scrub as vk_scrub
 
 log = logging.getLogger("aion")
 MAX_PUBLISH_ATTEMPTS = 3
@@ -21,8 +22,10 @@ MAX_PUBLISH_ATTEMPTS = 3
 class Service:
     def __init__(self, cfg: Config, db: DB, tg: Telegram,
                  now: Callable[[], dt.datetime] = P.now_msk,
-                 fetch_image: Callable[[dict, list[str]], tuple[bytes | None, str]] = P.fetch_image):
+                 fetch_image: Callable[[dict, list[str]], tuple[bytes | None, str]] = P.fetch_image,
+                 vk=None):
         self.cfg, self.db, self.tg, self.now, self.fetch_image = cfg, db, tg, now, fetch_image
+        self.vk = vk                    # vk.VK или None — тогда посты выходят только в Telegram
         self.images = cfg.data_dir / "images"
         self.images.mkdir(parents=True, exist_ok=True)
 
@@ -57,6 +60,8 @@ class Service:
             problems = json.loads(b["problems"])
             if rows:
                 text = P.build_digest(b["day"], [json.loads(r["data"]) for r in rows], problems, self.cfg.slots)
+                if self.vk:
+                    text = text.replace(" по одному.", " по одному, и в канал, и в ВК.", 1)
             else:
                 text = "❌ Aion Space: подборка за %s пришла, но подходящих постов нет.\n%s" % (
                     b["day"], "\n".join("- " + x for x in problems))[:4000]
@@ -130,22 +135,51 @@ class Service:
                 self._publish(r["id"])
 
     def _publish(self, pid: int) -> None:
+        """Telegram и ВК независимы: каждая площадка публикуется один раз, сбой одной не мешает другой.
+        Статус поста (published/failed) — по Telegram; у ВК свой vk_status."""
         r = self.db.get(pid)
-        try:
-            msg_id, file_id = self._send_parts(self.cfg.channel_id, r)
-        except Exception as ex:
-            err = scrub(str(ex))[:300]
-            attempts = r["attempts"] + 1
-            new = "failed" if attempts >= MAX_PUBLISH_ATTEMPTS else "approved"
-            self.db.transition(pid, ("publishing",), new, attempts=attempts, error=err)
-            log.warning("пост %s не ушёл в канал (попытка %d): %s", pid, attempts, err)
-            if new == "failed":
-                self._refresh_control(pid)
+        err = None
+        if not r["channel_msg"]:
+            try:
+                msg_id, file_id = self._send_parts(self.cfg.channel_id, r)
+                self.db.update(pid, channel_msg=msg_id, image_file_id=file_id or r["image_file_id"])
+                log.info("пост %s опубликован в канал, сообщение %s", pid, msg_id)
+            except Exception as ex:
+                err = scrub(str(ex))[:300]
+        self._publish_vk(pid)
+        if err is None:
+            self.db.transition(pid, ("publishing",), "published", published_at=self.now().isoformat(), error=None)
+            self._refresh_control(pid)
             return
-        self.db.transition(pid, ("publishing",), "published", published_at=self.now().isoformat(),
-                           channel_msg=msg_id, image_file_id=file_id or r["image_file_id"], error=None)
-        log.info("пост %s опубликован, сообщение %s", pid, msg_id)
-        self._refresh_control(pid)
+        attempts = r["attempts"] + 1
+        new = "failed" if attempts >= MAX_PUBLISH_ATTEMPTS else "approved"
+        self.db.transition(pid, ("publishing",), new, attempts=attempts, error=err)
+        log.warning("пост %s не ушёл в канал (попытка %d): %s", pid, attempts, err)
+        if new == "failed":
+            self._refresh_control(pid)
+
+    def _publish_vk(self, pid: int, force: bool = False) -> None:
+        if not self.vk:
+            return
+        r = self.db.get(pid)
+        if r["vk_status"] == "published" or (r["vk_status"] == "unknown" and not force):
+            return
+        image = None
+        if r["image_path"]:
+            try:
+                with open(r["image_path"], "rb") as f:
+                    image = f.read()
+            except OSError:
+                pass
+        try:
+            post_id = self.vk.post(P.vk_text(json.loads(r["data"]), image is not None), image)
+        except Exception as ex:
+            status = "unknown" if getattr(ex, "no_retry", False) else "failed"
+            self.db.update(pid, vk_status=status, vk_error=vk_scrub(str(ex))[:300])
+            log.warning("пост %s не вышел в ВК (%s): %s", pid, status, vk_scrub(str(ex)))
+            return
+        self.db.update(pid, vk_status="published", vk_post_id=post_id, vk_error=None)
+        log.info("пост %s опубликован в ВК, запись %s", pid, post_id)
 
     # ------------------------------------------------------------------ карточка управления
     def channel_link(self, msg_id: int | None) -> str:
@@ -158,14 +192,30 @@ class Service:
             return "https://t.me/c/%s/%s" % (ch[4:], msg_id)
         return ""
 
+    def _vk_line(self, r) -> str:
+        if not self.vk or r["status"] not in ("published", "failed"):
+            return ""
+        st = r["vk_status"]
+        if st == "published":
+            return "\nВК: ✅ %s" % self.vk.wall_link(r["vk_post_id"])
+        if st == "failed":
+            return "\nВК: ⚠️ не вышло: %s" % (r["vk_error"] or "ошибка")
+        if st == "unknown":
+            return "\nВК: ❓ ответ ВК потерян, запись могла выйти. Проверьте стену группы, прежде чем повторять"
+        return ""
+
     def _control_text(self, r) -> str:
+        return self._control_body(r) + self._vk_line(r)
+
+    def _control_body(self, r) -> str:
         data = json.loads(r["data"])
         total = len(self.db.batch_posts(r["batch_id"]))
         head = "Пост %d из %d · %s\n«%s»" % (r["n"], total, data.get("rubric", ""), r["title"])
         st = r["status"]
         if st in ("new", "review"):
             note = "\n⚠️ Без фото: %s" % r["image_note"] if r["image_note"] and not r["image_path"] else ""
-            return "%s%s\n\nОпубликовать в канале?" % (head, note)
+            where = "в канале и в ВК" if self.vk else "в канале"
+            return "%s%s\n\nОпубликовать %s?" % (head, note, where)
         if st == "approved":
             return "%s\n\n✅ Утверждён, выйдет %s" % (head, P.human_time(r["slot_at"], self.now()))
         if st == "publishing":
@@ -190,8 +240,11 @@ class Service:
             return kb([("🚀 Сейчас", "now:%d" % i), ("↩️ Отменить", "un:%d" % i)])
         if st in ("rejected", "expired"):
             return kb([("↩️ Вернуть", "un:%d" % i)])
+        vk_retry = [("🔁 ВК ещё раз", "vk:%d" % i)] if self.vk and r["vk_status"] in ("failed", "unknown") else []
         if st == "failed":
-            return kb([("🔁 Повторить", "now:%d" % i)])
+            return kb([("🔁 Повторить", "now:%d" % i)] + vk_retry)
+        if vk_retry:
+            return kb(vk_retry)
         return {"inline_keyboard": []}
 
     def _refresh_control(self, pid: int) -> None:
@@ -246,6 +299,12 @@ class Service:
                 r = self.db.get(pid)
                 return "Опубликован" if r["status"] == "published" else "Не вышло, повторю"
             return "Уже обработан"
+        if action == "vk":
+            r = self.db.get(pid)
+            if not self.vk or r["status"] not in ("published", "failed") or not self.db.vk_claim(pid):
+                return "Уже обработан"
+            self._publish_vk(pid, force=True)
+            return "Вышло в ВК" if self.db.get(pid)["vk_status"] == "published" else "ВК снова не принял"
         return "Неизвестная кнопка"
 
     def status_text(self) -> str:

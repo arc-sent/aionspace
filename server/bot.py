@@ -15,6 +15,8 @@ from config import Config
 from db import DB
 from service import Service
 from tg import Telegram, TelegramError, scrub
+from vk import VK, group_from_link
+from vk import scrub as vk_scrub
 
 TICK_SEC = 20
 
@@ -30,7 +32,20 @@ def main() -> int:
         return 2
     db = DB(cfg.data_dir / "aion.db")
     tg = Telegram(cfg.telegram_token, cfg.telegram_api, cfg.telegram_proxy)
-    service = Service(cfg, db, tg)
+    vk = None
+    if cfg.vk_enabled:
+        vk = VK(cfg.vk_token, group_from_link(cfg.vk_group), cfg.vk_proxy)
+        try:
+            note = "✅ ВК подключён: группа %s. Утверждённые посты будут выходить и туда." % vk.check()
+        except Exception as ex:
+            note = ("⚠️ ВК: %s\nПроверьте VK_TOKEN (нужен токен пользователя-админа группы с правами wall, photos, "
+                    "offline) и VK_GROUP. Пока не исправите, ВК будет показывать ошибку в карточках." % vk_scrub(str(ex)))
+        log.info(vk_scrub(note))
+        try:
+            tg.send_text(cfg.admin_chat_id, note, html_mode=False)
+        except TelegramError as ex:
+            log.warning("не отправил сообщение о ВК: %s", scrub(str(ex)))
+    service = Service(cfg, db, tg, vk=vk)
     try:
         me = tg.call("getMe").get("username")
     except TelegramError as ex:          # сеть могла ещё не подняться: работаем дальше, тик и опрос повторят

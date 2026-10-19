@@ -17,3 +17,6 @@ autopost/.running
 
 # база и картинки сервера
 server/data/
+
+# резервные копии
+*.bak

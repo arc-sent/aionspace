@@ -12,12 +12,22 @@
     "mode": "own",
     "dir": "C:\\Users\\androed\\Desktop\\Marionette\\marionette\\autostart\\vpn",
     "check_url": "https://api.anthropic.com/v1/models",
-    "prefer": ["Герман", "Germany", "German", "🇩🇪", "Frankfurt", "Франкфурт", "Berlin", "Берлин"],
+    "prefer": [
+      "Герман",
+      "Germany",
+      "German",
+      "🇩🇪",
+      "Frankfurt",
+      "Франкфурт",
+      "Berlin",
+      "Берлин"
+    ],
     "max_probe": 8
   },
   "wake_pc": true,
   "task_hours": 2,
   "sleep_after": true,
   "sleep_only_if_idle_minutes": 10,
-  "python": ""
+  "python": "",
+  "delivery": "server"
 }

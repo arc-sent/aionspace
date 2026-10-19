@@ -55,6 +55,13 @@ class Config:
     expire_hours: int = 24
     history_days: int = 30
     image_domains: list[str] = field(default_factory=lambda: list(DEFAULT_IMAGE_DOMAINS))
+    vk_token: str = ""
+    vk_group: str = ""          # ссылка на группу, короткое имя или число; пусто — ВК выключен
+    vk_proxy: str = ""
+
+    @property
+    def vk_enabled(self) -> bool:
+        return bool(self.vk_token and self.vk_group)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -73,6 +80,9 @@ class Config:
             telegram_proxy=e("TELEGRAM_PROXY", ""),
             expire_hours=int(e("EXPIRE_HOURS") or 24),
             history_days=int(e("HISTORY_DAYS") or 30),
+            vk_token=e("VK_TOKEN", ""),
+            vk_group=e("VK_GROUP", ""),
+            vk_proxy=e("VK_PROXY", ""),
         )
         if e("IMAGE_DOMAINS"):
             cfg.image_domains = [d.strip().lower() for d in e("IMAGE_DOMAINS").split(",") if d.strip()]
