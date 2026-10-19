@@ -61,7 +61,7 @@ class Config:
     # Дзен: статьи выходят в отдельный Telegram-канал, который @zen_sync_bot переносит в Дзен
     dzen_channel_id: str = ""
     dzen_slots: list[tuple[int, int]] = field(default_factory=lambda: [(12, 0)])
-    dzen_cta: str = "Каждый день новости космоса простыми словами — в Telegram-канале Aion Space: t.me/aion_space"
+    dzen_cta: str = "Новости космоса каждый день — в Telegram-канале Aion Space: t.me/aion_space"
     dzen_cta_marker: str = "aion_space"   # если крючка на основной канал в тексте нет, программа добавит dzen_cta
 
     @property

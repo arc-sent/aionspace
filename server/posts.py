@@ -122,6 +122,8 @@ def validate_articles(data: object, seen_sources: set[str]) -> tuple[list[dict],
                 tags.append(t if t.startswith("#") else "#" + t)
         out.append({
             "kind": "dzen",
+            # short — фото с подписью до 1024 знаков (в Дзен уходит с картинкой); long — большая статья текстом
+            "format": "short" if str(a.get("format", "")).strip().lower() == "short" else "long",
             "rubric": str(a.get("rubric", "")).strip() or "Статья",
             "title": title, "lead": str(a.get("lead", "")).strip(), "sections": sections,
             "outro": str(a.get("outro", "")).strip(), "cta": str(a.get("cta", "")).strip(),
@@ -138,10 +140,12 @@ def validate_articles(data: object, seen_sources: set[str]) -> tuple[list[dict],
     return out, problems
 
 
-def build_article(a: dict, default_cta: str, cta_marker: str, with_credit: bool = True) -> tuple[str, list[str]]:
-    """Статья одним сообщением (до 4096 знаков): жирный заголовок, лид, разделы с жирными подзаголовками,
-    концовка, крючок на основной канал, фото/источник, хештеги. Если длиннее лимита — с конца убираются
-    разделы (минимум два остаются). Возвращает (HTML, предупреждения)."""
+def build_article(a: dict, default_cta: str, cta_marker: str, with_credit: bool = True,
+                  limit: int = TEXT_LIMIT) -> tuple[str, list[str]]:
+    """Статья одним сообщением: жирный заголовок, лид, разделы с жирными подзаголовками, концовка, крючок
+    на основной канал, фото/источник, хештеги. limit — 4096 для большой статьи (текст) или 1024 для короткой
+    (подпись к фото). Если длиннее — сокращается: с конца убираются разделы (один остаётся), затем
+    последние предложения, затем лид. Возвращает (HTML, предупреждения)."""
     e = html.escape
     warns: list[str] = []
     cta = a.get("cta") or ""
@@ -168,13 +172,35 @@ def build_article(a: dict, default_cta: str, cta_marker: str, with_credit: bool 
             tail.append(e(" ".join(a["hashtags"])))
         return "\n\n".join(parts) + "\n\n" + "\n".join(tail)
 
+    def too_long(t):
+        return utf16_len(plain(t)) > limit
+
     text = assemble(sections)
-    while utf16_len(plain(text)) > TEXT_LIMIT - 50 and len(sections) > 2:
+    while too_long(text) and len(sections) > 1:
         dropped = sections.pop()
-        warns.append("«%s»: длиннее лимита Telegram, убран раздел «%s»" % (a["title"][:40], dropped.get("heading", "")[:40]))
+        warns.append("«%s»: длиннее %d знаков, убран раздел «%s»" % (a["title"][:40], limit, dropped.get("heading", "")[:40]))
         text = assemble(sections)
-    if utf16_len(plain(text)) > TEXT_LIMIT:
-        raise ValueError("статья длиннее 4096 знаков даже после сокращения")
+    if too_long(text):
+        # последний раздел: убираем предложения с конца, пока не влезет (первое предложение остаётся)
+        last = dict(sections[-1])
+        paras = list(last["paragraphs"])
+        while too_long(text):
+            sentences = re.split(r"(?<=[.!?…])\s+", paras[-1])
+            if len(sentences) > 1:
+                paras[-1] = " ".join(sentences[:-1])
+            elif len(paras) > 1:
+                paras.pop()
+            else:
+                break
+            last["paragraphs"] = paras
+            text = assemble(sections[:-1] + [last])
+        sections = sections[:-1] + [last]
+        warns.append("«%s»: текст сокращён до %d знаков" % (a["title"][:40], limit))
+    if too_long(text) and a.get("lead"):
+        a = {**a, "lead": ""}
+        text = assemble(sections)
+    if too_long(text):
+        raise ValueError("статья длиннее %d знаков даже после сокращения" % limit)
     return text, warns
 
 
@@ -240,7 +266,8 @@ def build_digest(day: str, posts: list[dict], problems: list[str], slots: list[t
             lines.append("   Видео: " + p["video_idea"])
         lines.append("")
     for i, a in enumerate(articles or [], 1):
-        lines.append("Дзен %d. %s: %s" % (i, a["rubric"], a["title"]))
+        fmt = "короткая, фото" if a.get("format") == "short" else "большая"
+        lines.append("Дзен %d (%s). %s: %s" % (i, fmt, a["rubric"], a["title"]))
         if a.get("interactive"):
             lines.append("   Интерактив: " + a["interactive"])
         if a.get("check"):

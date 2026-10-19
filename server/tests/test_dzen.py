@@ -79,7 +79,7 @@ def test_article_flow_own_channel_slot_and_no_vk(env):
     assert len(ids) == 2
     art = [i for i in ids if svc.db.get(i)["target"] == "dzen"][0]
     card = [m for m in tg.to(ADMIN) if m["markup"] and "ap:%d" % art in str(m["markup"])][0]["payload"]
-    assert card.startswith("Статья для Дзена 1 из 1") and "в @interesOKosmose (оттуда — в Дзен)" in card
+    assert card.startswith("Большая статья для Дзена 1 из 1") and "в @interesOKosmose (оттуда — в Дзен)" in card
     assert "https://science.nasa.gov/venus1.jpg" in tg.previews        # карточка с превью картинки
 
     press(svc, "ap", art)
@@ -110,3 +110,29 @@ def test_articles_rejected_without_dzen_channel(tmp_path):
     svc = Service(cfg, DB(tmp_path / "a.db"), FakeTG(), now=Clock(dt.datetime(2026, 10, 19, 8, tzinfo=MSK)))
     res = svc.ingest({"articles": [article()]})
     assert res["articles"] == 0 and "DZEN_CHANNEL_ID" in res["problems"][-1]
+
+
+def test_short_article_goes_as_photo_with_caption(env):
+    svc, tg, fvk, clock = env
+    short = article(format="short", sections=[{"heading": "Факт", "paragraphs": ["Один удивительный факт."]}])
+    svc.ingest({"articles": [short, article(2)]})
+    svc.tick()
+    s_id, l_id = control_ids(tg)
+    cards = [m["payload"] for m in tg.to(ADMIN) if m["markup"]]
+    assert cards[0].startswith("Короткая статья для Дзена (фото) 1 из 2")
+    assert cards[1].startswith("Большая статья для Дзена 2 из 2")
+    press(svc, "now", s_id)
+    press(svc, "now", l_id)
+    out = tg.to(DZEN)
+    assert [m["kind"] for m in out] == ["photo", "text"]
+    assert out[0]["payload"]["photo"].startswith("FILE")                # то же фото, что в карточке
+    cap = out[0]["payload"]["caption"]
+    assert P.utf16_len(P.plain(cap)) <= 1024 and "t.me/aion_space" in cap and "Фото: NASA/JPL" in cap
+
+
+def test_short_article_is_trimmed_to_caption_limit():
+    long_secs = [{"heading": "Раздел %d" % i, "paragraphs": ["Предложение номер %d. " % i * 20]} for i in range(3)]
+    a = P.validate_articles({"articles": [article(format="short", sections=long_secs)]}, set())[0][0]
+    text, warns = P.build_article(a, "t.me/aion_space", "aion_space", limit=P.CAPTION_LIMIT)
+    assert P.utf16_len(P.plain(text)) <= 1024 and warns
+    assert "Раздел 0" in text and "Раздел 2" not in text and "t.me/aion_space" in text

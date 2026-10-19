@@ -124,7 +124,15 @@ class Service:
         """Отправить пост как он выглядит в канале. (id первого сообщения, file_id фото)."""
         data = json.loads(r["data"])
         if self._is_dzen(r):
-            # статья — одно сообщение до 4096 знаков; фото — крупное превью ссылки на картинку над текстом
+            photo = self._image_ref(r) if data.get("format") == "short" else None
+            if photo is not None:
+                # короткая статья — обычное фото с подписью до 1024 знаков: так @zen_sync_bot переносит картинку
+                text, _ = P.build_article(data, self.cfg.dzen_cta, self.cfg.dzen_cta_marker, limit=P.CAPTION_LIMIT)
+                res = self.tg.send_photo(chat, photo, text)
+                file_id = res["photo"][-1]["file_id"] if res.get("photo") else r["image_file_id"]
+                return res["message_id"], file_id
+            # большая статья — одно сообщение до 4096 знаков; картинка — превью ссылки над текстом
+            # (в Telegram видна, в Дзен @zen_sync_bot её не переносит)
             text, _ = P.build_article(data, self.cfg.dzen_cta, self.cfg.dzen_cta_marker,
                                       with_credit=bool(r["image_src"]))
             res = self.tg.send_text(chat, text, preview_url=r["image_src"] or "")
@@ -239,7 +247,10 @@ class Service:
         data = json.loads(r["data"])
         same = [x for x in self.db.batch_posts(r["batch_id"]) if x["target"] == r["target"]]
         n = next((k for k, x in enumerate(same, 1) if x["id"] == r["id"]), r["n"])
-        kind = "Статья для Дзена" if self._is_dzen(r) else "Пост"
+        if self._is_dzen(r):
+            kind = "Короткая статья для Дзена (фото)" if data.get("format") == "short" else "Большая статья для Дзена"
+        else:
+            kind = "Пост"
         head = "%s %d из %d · %s\n«%s»" % (kind, n, len(same), data.get("rubric", ""), r["title"])
         st = r["status"]
         if st in ("new", "review"):
