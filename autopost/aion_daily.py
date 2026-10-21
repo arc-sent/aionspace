@@ -171,14 +171,27 @@ def server_history(cfg: dict, env: dict) -> list[dict]:
     url, token = env.get("AION_SERVER_URL", "").rstrip("/"), env.get("AION_SERVER_TOKEN", "")
     if cfg.get("delivery") != "server" or not url or not token:
         return []
-    try:
-        r = requests.get(url + "/history", params={"days": cfg["history_days"]},
-                         headers={"Authorization": "Bearer " + token}, timeout=30)
-        r.raise_for_status()
-        return list(r.json().get("items") or [])
-    except (requests.RequestException, ValueError) as ex:
-        log("история с сервера не получена: %s" % ex)
-        return []
+    last = "?"
+    for attempt in range(1, 4):
+        for proxies in server_routes(env):
+            try:
+                r = requests.get(url + "/history", params={"days": cfg["history_days"]},
+                                 headers={"Authorization": "Bearer " + token}, timeout=30, proxies=proxies)
+                r.raise_for_status()
+                return list(r.json().get("items") or [])
+            except (requests.RequestException, ValueError) as ex:
+                last = str(ex)
+        time.sleep(10 * attempt)
+    # без истории Claude может повторить уже бывшие темы; сервер их всё равно отсеет, но подборка станет меньше
+    log("история с сервера не получена: %s" % last)
+    return []
+
+
+def server_routes(env: dict) -> list[dict | None]:
+    """Как ходить на сервер Aion: напрямую, а если не вышло — через TELEGRAM_PROXY из .env (VPN-клиент).
+    Прямое соединение иногда рвётся на HTTPS, пока VPN-клиент переподключается."""
+    proxy = env.get("TELEGRAM_PROXY", "")
+    return [None, {"https": proxy, "http": proxy}] if proxy else [None]
 
 
 def recent_topics(cfg: dict, today: dt.date, target: str = "main") -> str:
@@ -620,6 +633,52 @@ def connect_tg(tg: Telegram, cfg: dict) -> bool:
     return False
 
 
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259             # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def take_lock(force: bool = False) -> bool:
+    """Метка «идёт запуск». Создаётся атомарно (O_EXCL): если основная и запасная задачи Планировщика
+    стартуют в одну секунду (ПК включили после пропущенного времени), второй запуск сразу выходит.
+    Брошенная метка (процесса уже нет, или ей больше 4 часов) снимается."""
+    for _ in range(2):
+        try:
+            fd = os.open(str(LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                info = LOCK.read_text(encoding="utf-8").split()
+                age = time.time() - LOCK.stat().st_mtime
+            except OSError:
+                continue
+            pid = int(info[0]) if info and info[0].isdigit() else 0
+            stale = age > 4 * 3600 or (pid and not pid_alive(pid)) or (not pid and age > 600)
+            if not (force or stale):
+                return False
+            log("снимаю брошенную метку .running (процесс %s)" % (pid or "неизвестен"))
+            LOCK.unlink(missing_ok=True)
+            continue
+        os.write(fd, ("%d %s" % (os.getpid(), now_msk().isoformat())).encode())
+        os.close(fd)
+        return True
+    return False
+
+
 def get_articles(args, cfg: dict, data: dict, today: dt.date, problems: list[str]) -> list[dict]:
     """Статьи для Дзена: вторым запуском Claude по dzen_prompt.txt (или из --from-json). Сбой не мешает постам."""
     if cfg.get("delivery") != "server" or int(cfg.get("dzen_articles_per_day") or 0) <= 0:
@@ -651,18 +710,23 @@ def push_batch(env: dict, today: dt.date, posts: list[dict], problems: list[str]
     _SECRETS.append(token)
     body = {"day": today.isoformat(), "posts": posts, "problems": problems, "articles": articles or []}
     last = "?"
-    for attempt in range(1, 4):
-        try:
-            r = requests.post(url + "/batch", json=body, headers={"Authorization": "Bearer " + token}, timeout=120)
-            if r.status_code == 200:
-                return r.json()
-            last = "HTTP %s: %s" % (r.status_code, r.text[:200])
-            if r.status_code in (400, 401):
-                break
-        except requests.RequestException as ex:
-            last = str(ex)
-        log("сервер Aion, попытка %d: %s" % (attempt, last))
-        time.sleep(10 * attempt)
+    delays = [15, 30, 60, 120, 240]                  # всего около 8 минут: переждать переподключение VPN
+    for attempt in range(1, len(delays) + 2):
+        for proxies in server_routes(env):
+            try:
+                r = requests.post(url + "/batch", json=body, headers={"Authorization": "Bearer " + token},
+                                  timeout=120, proxies=proxies)
+                if r.status_code == 200:
+                    return r.json()
+                last = "HTTP %s: %s" % (r.status_code, r.text[:200])
+                if r.status_code in (400, 401):
+                    raise RuntimeError(last)
+            except requests.RequestException as ex:
+                last = str(ex)
+        if attempt > len(delays):
+            break
+        log("сервер Aion, попытка %d: %s; повтор через %d с" % (attempt, last, delays[attempt - 1]))
+        time.sleep(delays[attempt - 1])
     raise RuntimeError(last)
 
 
@@ -676,10 +740,9 @@ def cmd_run(args, cfg: dict, env: dict) -> int:
     if done.exists() and not args.force and not args.dry_run:
         log("подборка за сегодня уже отправлена")
         return 10
-    if LOCK.exists() and time.time() - LOCK.stat().st_mtime < 4 * 3600 and not args.force:
-        log("другой запуск ещё идёт (.running моложе 4 часов)")
+    if not take_lock(args.force):
+        log("другой запуск ещё идёт (.running)")
         return 11
-    LOCK.write_text(now_msk().isoformat(), encoding="utf-8")
     keep_awake(True)
     tg_vpn = False
     try:
